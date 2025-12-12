@@ -1,0 +1,22 @@
+{
+  "germany": {
+    "display_name": "Германия",
+    "country_query": "Германия"
+  },
+  "spain": {
+    "display_name": "Испания",
+    "country_query": "Испания"
+  },
+  "portugal": {
+    "display_name": "Португалия",
+    "country_query": "Португалия"
+  },
+  "italy": {
+    "display_name": "Италия",
+    "country_query": "Италия"
+  },
+  "netherlands": {
+    "display_name": "Нидерланды",
+    "country_query": "Нидерланды"
+  }
+}
