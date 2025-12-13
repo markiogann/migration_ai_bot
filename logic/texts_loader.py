@@ -10,6 +10,7 @@ _SEARCH_DIRS = [
     BASE_DIR,
 ]
 
+
 def _find_file(name: str) -> Optional[Path]:
     for d in _SEARCH_DIRS:
         path = d / name
@@ -21,8 +22,8 @@ def _find_file(name: str) -> Optional[Path]:
 MESSAGES_FILE = _find_file("messages.json")
 POPULAR_COUNTRIES_FILE = _find_file("popular_countries.json")
 
-_messages_cache: Dict[str, str] = {}
-_popular_countries_cache: Dict[str, Dict[str, Any]] = {}
+_messages_cache: Optional[Dict[str, str]] = None
+_popular_countries_cache: Optional[Dict[str, Dict[str, Any]]] = None
 
 
 def _load_messages() -> None:
@@ -35,7 +36,13 @@ def _load_messages() -> None:
 
     try:
         with MESSAGES_FILE.open("r", encoding="utf-8") as f:
-            _messages_cache = json.load(f)
+            data = json.load(f)
+
+        if isinstance(data, dict):
+            _messages_cache = {str(k): str(v) for k, v in data.items()}
+        else:
+            print("[texts_loader] messages.json must contain object at top level")
+            _messages_cache = {}
     except Exception as e:
         print("[texts_loader] error loading messages.json:", repr(e))
         _messages_cache = {}
@@ -54,7 +61,11 @@ def _load_popular_countries() -> None:
             data = json.load(f)
 
         if isinstance(data, dict):
-            _popular_countries_cache = data
+            cleaned: Dict[str, Dict[str, Any]] = {}
+            for slug, cfg in data.items():
+                if isinstance(cfg, dict):
+                    cleaned[str(slug)] = cfg
+            _popular_countries_cache = cleaned
         else:
             print("[texts_loader] popular_countries.json must contain object at top level")
             _popular_countries_cache = {}
@@ -63,18 +74,29 @@ def _load_popular_countries() -> None:
         _popular_countries_cache = {}
 
 
-def msg(key: str, default: Optional[str] = None) -> Optional[str]:
-    if not _messages_cache:
+def reload_messages() -> None:
+    _load_messages()
+
+
+def reload_popular_countries() -> None:
+    _load_popular_countries()
+
+
+def msg(key: str, default: str = "") -> str:
+    global _messages_cache
+    if _messages_cache is None:
         _load_messages()
+    assert _messages_cache is not None
     return _messages_cache.get(key, default)
 
 
 def get_popular_countries() -> Dict[str, Dict[str, Any]]:
-    if not _popular_countries_cache:
+    global _popular_countries_cache
+    if _popular_countries_cache is None:
         _load_popular_countries()
+    assert _popular_countries_cache is not None
     return _popular_countries_cache
 
 
 def get_country_by_slug(slug: str) -> Optional[Dict[str, Any]]:
-    countries = get_popular_countries()
-    return countries.get(slug)
+    return get_popular_countries().get(slug)

@@ -1,6 +1,7 @@
 import os
 import asyncpg
 from typing import Optional, Dict, List
+from datetime import datetime
 
 from dotenv import load_dotenv
 
@@ -10,8 +11,27 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 _pool: Optional[asyncpg.Pool] = None
 
-# максимум сообщений на пользователя (user+assistant), старые будут удаляться
 MAX_MESSAGES_PER_USER = 200
+
+ALLOWED_PROFILE_FIELDS = {
+    "username",
+    "first_name",
+    "last_name",
+    "language_code",
+    "home_country",
+    "target_country",
+    "migration_goal",
+    "budget",
+    "profession",
+    "notes",
+    "boost_until",
+}
+
+
+def _require_pool() -> asyncpg.Pool:
+    if _pool is None:
+        raise RuntimeError("DB pool is not initialized")
+    return _pool
 
 
 async def init_db():
@@ -21,8 +41,8 @@ async def init_db():
 
     _pool = await asyncpg.create_pool(DATABASE_URL)
 
-    async with _pool.acquire() as conn:
-        # пользователи
+    pool = _require_pool()
+    async with pool.acquire() as conn:
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -44,7 +64,13 @@ async def init_db():
             """
         )
 
-        # сообщения (добавили столбец mode)
+        await conn.execute(
+            """
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS boost_until TIMESTAMPTZ;
+            """
+        )
+
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS messages (
@@ -58,7 +84,6 @@ async def init_db():
             """
         )
 
-        # кэш общей информации по странам
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS country_info_cache (
@@ -69,6 +94,16 @@ async def init_db():
                 created_at    TIMESTAMPTZ DEFAULT NOW()
             );
             """
+        )
+
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_user_id_id ON messages (tg_user_id, id);"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_user_mode_role_created ON messages (tg_user_id, mode, role, created_at);"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_country_cache_key ON country_info_cache (country_key);"
         )
 
 
@@ -86,10 +121,8 @@ async def ensure_user(
     last_name: Optional[str],
     language_code: Optional[str],
 ):
-    if _pool is None:
-        raise RuntimeError("DB pool is not initialized")
-
-    async with _pool.acquire() as conn:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
         await conn.execute(
             """
             INSERT INTO users (
@@ -97,11 +130,11 @@ async def ensure_user(
             )
             VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (tg_user_id) DO UPDATE
-            SET username     = EXCLUDED.username,
-                first_name   = EXCLUDED.first_name,
-                last_name    = EXCLUDED.last_name,
-                language_code= EXCLUDED.language_code,
-                updated_at   = NOW();
+            SET username      = EXCLUDED.username,
+                first_name    = EXCLUDED.first_name,
+                last_name     = EXCLUDED.last_name,
+                language_code = EXCLUDED.language_code,
+                updated_at    = NOW();
             """,
             tg_user_id,
             username,
@@ -112,25 +145,23 @@ async def ensure_user(
 
 
 async def get_user_profile(tg_user_id: int) -> Optional[Dict]:
-    if _pool is None:
-        raise RuntimeError("DB pool is not initialized")
-
-    async with _pool.acquire() as conn:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT * FROM users WHERE tg_user_id = $1;",
             tg_user_id,
         )
-    if row is None:
-        return None
-    return dict(row)
+    return dict(row) if row else None
 
 
 async def update_user_profile(tg_user_id: int, **fields):
-    if _pool is None:
-        raise RuntimeError("DB pool is not initialized")
-
+    pool = _require_pool()
     if not fields:
         return
+
+    for key in list(fields.keys()):
+        if key not in ALLOWED_PROFILE_FIELDS:
+            raise ValueError(f"Invalid profile field: {key}")
 
     set_clauses = []
     values: List = []
@@ -146,49 +177,45 @@ async def update_user_profile(tg_user_id: int, **fields):
     sql = f"UPDATE users SET {', '.join(set_clauses)} WHERE tg_user_id = ${idx}"
     values.append(tg_user_id)
 
-    async with _pool.acquire() as conn:
+    async with pool.acquire() as conn:
         await conn.execute(sql, *values)
 
 
 async def save_message(tg_user_id: int, role: str, text: str, mode: str = "chat"):
-    if _pool is None:
-        raise RuntimeError("DB pool is not initialized")
+    pool = _require_pool()
 
-    async with _pool.acquire() as conn:
-        # сохраняем сообщение
-        await conn.execute(
-            """
-            INSERT INTO messages (tg_user_id, role, text, mode)
-            VALUES ($1, $2, $3, $4);
-            """,
-            tg_user_id,
-            role,
-            text,
-            mode,
-        )
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                """
+                INSERT INTO messages (tg_user_id, role, text, mode)
+                VALUES ($1, $2, $3, $4);
+                """,
+                tg_user_id,
+                role,
+                text,
+                mode,
+            )
 
-        # обрезаем историю до MAX_MESSAGES_PER_USER
-        await conn.execute(
-            """
-            DELETE FROM messages
-            WHERE id IN (
-                SELECT id
-                FROM messages
-                WHERE tg_user_id = $1
-                ORDER BY created_at ASC
-                OFFSET $2
-            );
-            """,
-            tg_user_id,
-            MAX_MESSAGES_PER_USER,
-        )
+            await conn.execute(
+                """
+                DELETE FROM messages
+                WHERE id IN (
+                    SELECT id
+                    FROM messages
+                    WHERE tg_user_id = $1
+                    ORDER BY id ASC
+                    OFFSET $2
+                );
+                """,
+                tg_user_id,
+                MAX_MESSAGES_PER_USER,
+            )
 
 
 async def get_recent_messages(tg_user_id: int, limit: int = 6) -> List[Dict]:
-    if _pool is None:
-        raise RuntimeError("DB pool is not initialized")
-
-    async with _pool.acquire() as conn:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
             SELECT role, text, created_at
@@ -200,17 +227,12 @@ async def get_recent_messages(tg_user_id: int, limit: int = 6) -> List[Dict]:
             tg_user_id,
             limit,
         )
-
     return [dict(r) for r in reversed(rows)]
 
 
 async def get_daily_user_message_count(tg_user_id: int, mode: str) -> int:
-    """
-    Считаем, сколько сообщений пользователь отправил СЕГОДНЯ в указанном режиме.
-    """
-    if _pool is None:
-        raise RuntimeError("DB pool is not initialized")
-    async with _pool.acquire() as conn:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
         value = await conn.fetchval(
             """
             SELECT COUNT(*)
@@ -218,7 +240,7 @@ async def get_daily_user_message_count(tg_user_id: int, mode: str) -> int:
             WHERE tg_user_id = $1
               AND role = 'user'
               AND mode = $2
-              AND created_at::date = CURRENT_DATE;
+              AND (created_at AT TIME ZONE 'UTC')::date = (NOW() AT TIME ZONE 'UTC')::date;
             """,
             tg_user_id,
             mode,
@@ -231,29 +253,23 @@ def _normalize_country_key(raw: str) -> str:
 
 
 async def get_cached_country_info(country_key: str) -> Optional[str]:
-    if _pool is None:
-        raise RuntimeError("DB pool is not initialized")
-
+    pool = _require_pool()
     key = _normalize_country_key(country_key)
 
-    async with _pool.acquire() as conn:
+    async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT answer FROM country_info_cache WHERE country_key = $1;",
             key,
         )
 
-    if row is None:
-        return None
-    return row["answer"]
+    return row["answer"] if row else None
 
 
 async def save_cached_country_info(country_key: str, country_query: str, answer: str):
-    if _pool is None:
-        raise RuntimeError("DB pool is not initialized")
-
+    pool = _require_pool()
     key = _normalize_country_key(country_key)
 
-    async with _pool.acquire() as conn:
+    async with pool.acquire() as conn:
         await conn.execute(
             """
             INSERT INTO country_info_cache (country_key, country_query, answer)
@@ -267,3 +283,197 @@ async def save_cached_country_info(country_key: str, country_query: str, answer:
             country_query,
             answer,
         )
+
+async def delete_cached_country_info(country_key: str) -> None:
+    if _pool is None:
+        raise RuntimeError("DB pool is not initialized")
+
+    key = _normalize_country_key(country_key)
+
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM country_info_cache WHERE country_key = $1;",
+            key,
+        )
+
+
+async def get_user_boost_until(tg_user_id: int) -> Optional[datetime]:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        value = await conn.fetchval(
+            "SELECT boost_until FROM users WHERE tg_user_id = $1;",
+            tg_user_id,
+        )
+    return value
+
+
+async def add_boost_days(tg_user_id: int, days: int = 7):
+    pool = _require_pool()
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE users
+            SET boost_until = GREATEST(COALESCE(boost_until, NOW()), NOW()) + ($2 * INTERVAL '1 day'),
+                updated_at  = NOW()
+            WHERE tg_user_id = $1;
+            """,
+            tg_user_id,
+            int(days),
+        )
+from datetime import timedelta
+
+async def admin_get_stats() -> Dict[str, int]:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        total_users = await conn.fetchval("SELECT COUNT(*) FROM users;")
+        new_today = await conn.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM users
+            WHERE (created_at AT TIME ZONE 'UTC')::date = (NOW() AT TIME ZONE 'UTC')::date;
+            """
+        )
+        chat_today = await conn.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM messages
+            WHERE role = 'user'
+              AND mode = 'chat'
+              AND (created_at AT TIME ZONE 'UTC')::date = (NOW() AT TIME ZONE 'UTC')::date;
+            """
+        )
+        country_today = await conn.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM messages
+            WHERE role = 'user'
+              AND mode = 'country'
+              AND (created_at AT TIME ZONE 'UTC')::date = (NOW() AT TIME ZONE 'UTC')::date;
+            """
+        )
+        boosts_active = await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE boost_until IS NOT NULL AND boost_until > NOW();"
+        )
+        cache_size = await conn.fetchval("SELECT COUNT(*) FROM country_info_cache;")
+
+    return {
+        "total_users": int(total_users or 0),
+        "new_today": int(new_today or 0),
+        "chat_today": int(chat_today or 0),
+        "country_today": int(country_today or 0),
+        "boosts_active": int(boosts_active or 0),
+        "cache_size": int(cache_size or 0),
+    }
+
+
+async def admin_get_user(tg_user_id: int) -> Optional[Dict]:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM users WHERE tg_user_id = $1;", tg_user_id)
+    return dict(row) if row else None
+
+
+async def admin_find_users_by_username(query: str, limit: int = 10) -> List[Dict]:
+    pool = _require_pool()
+    q = (query or "").strip().lstrip("@")
+    if not q:
+        return []
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT tg_user_id, username, first_name, last_name, created_at
+            FROM users
+            WHERE username ILIKE $1
+            ORDER BY created_at DESC
+            LIMIT $2;
+            """,
+            f"%{q}%",
+            limit,
+        )
+    return [dict(r) for r in rows]
+
+
+async def admin_get_user_today_counts(tg_user_id: int) -> Dict[str, int]:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        chat_used = await conn.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM messages
+            WHERE tg_user_id = $1
+              AND role = 'user'
+              AND mode = 'chat'
+              AND (created_at AT TIME ZONE 'UTC')::date = (NOW() AT TIME ZONE 'UTC')::date;
+            """,
+            tg_user_id,
+        )
+        country_used = await conn.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM messages
+            WHERE tg_user_id = $1
+              AND role = 'user'
+              AND mode = 'country'
+              AND (created_at AT TIME ZONE 'UTC')::date = (NOW() AT TIME ZONE 'UTC')::date;
+            """,
+            tg_user_id,
+        )
+    return {"chat": int(chat_used or 0), "country": int(country_used or 0)}
+
+
+async def admin_clear_boost(tg_user_id: int):
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE users
+            SET boost_until = NULL,
+                updated_at = NOW()
+            WHERE tg_user_id = $1;
+            """,
+            tg_user_id,
+        )
+
+
+async def admin_list_cache(query: str, limit: int = 10) -> List[Dict]:
+    pool = _require_pool()
+    q = (query or "").strip()
+    async with pool.acquire() as conn:
+        if q:
+            rows = await conn.fetch(
+                """
+                SELECT country_key, country_query, created_at
+                FROM country_info_cache
+                WHERE country_key ILIKE $1 OR country_query ILIKE $1
+                ORDER BY created_at DESC
+                LIMIT $2;
+                """,
+                f"%{q}%",
+                limit,
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT country_key, country_query, created_at
+                FROM country_info_cache
+                ORDER BY created_at DESC
+                LIMIT $1;
+                """,
+                limit,
+            )
+    return [dict(r) for r in rows]
+
+
+async def admin_delete_cache(country_key: str):
+    pool = _require_pool()
+    key = _normalize_country_key(country_key)
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM country_info_cache WHERE country_key = $1;", key)
+
+
+async def admin_get_all_user_ids() -> List[int]:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT tg_user_id FROM users;")
+    return [int(r["tg_user_id"]) for r in rows]
