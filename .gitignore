@@ -2,13 +2,15 @@ venv/
 .venv/
 __pycache__/
 *.pyc
+
 .env
+.env.*
 
 .vs/
 .idea/
 .DS_Store
 
-data/messages.json
 data/*.db
 data/*.sqlite
+data/*.sqlite3
 *.log
