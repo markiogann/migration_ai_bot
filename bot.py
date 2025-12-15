@@ -2,6 +2,11 @@
 import inspect
 import html
 import re
+import os
+import socket
+from aiogram.client.session.aiohttp import AiohttpSession
+from dotenv import load_dotenv
+import hashlib
 
 from typing import Dict, Optional
 
@@ -47,6 +52,9 @@ from logic.db import (
     admin_get_all_user_ids,
 )
 from logic.texts_loader import msg, get_popular_countries, get_country_by_slug, reload_messages, reload_popular_countries
+load_dotenv()
+LOG_FILE_PATH = os.getenv("LOG_FILE_PATH") or os.path.join(os.path.dirname(__file__), "log.txt")
+LOG_TRUNCATE_ON_START = (os.getenv("LOG_TRUNCATE_ON_START", "1").strip() == "1")
 
 user_busy: Dict[int, bool] = {}
 profile_state: Dict[int, str] = {}
@@ -54,6 +62,41 @@ user_mode: Dict[int, str] = {}
 user_stage: Dict[int, str] = {}
 admin_state: Dict[int, str] = {}
 admin_tmp: Dict[int, Dict[str, str]] = {}
+user_last_ts: Dict[int, float] = {}
+
+def log_event(event: str, user_id: Optional[int] = None, mode: Optional[str] = None, err: Optional[Exception] = None):
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    uid = str(user_id) if user_id is not None else "-"
+    m = mode or "-"
+    e = repr(err) if err is not None else ""
+    line = f"[{ts}] {event} uid={uid} mode={m} {e}".strip()
+    try:
+        with open(LOG_FILE_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+    print(line)
+
+def validate_env():
+    missing = []
+    if not (BOT_TOKEN or "").strip():
+        missing.append("BOT_TOKEN")
+    if not (os.getenv("DATABASE_URL") or "").strip():
+        missing.append("DATABASE_URL")
+    if not (os.getenv("PPLX_API_KEY") or "").strip():
+        missing.append("PPLX_API_KEY")
+    if missing:
+        raise RuntimeError("Missing required env vars: " + ", ".join(missing))
+    if not (os.getenv("OPENAI_API_KEY") or "").strip():
+        log_event("openai_key_missing_fallback_enabled")
+
+def init_logging():
+    if LOG_TRUNCATE_ON_START:
+        try:
+            with open(LOG_FILE_PATH, "w", encoding="utf-8") as f:
+                f.write("")
+        except Exception:
+            pass
 
 
 BTN_MENU_CHAT = "💬 Общение с ботом"
@@ -71,17 +114,14 @@ COUNTRY_DAILY_LIMIT = 10
 CHAT_DAILY_LIMIT_BOOST = 30
 COUNTRY_DAILY_LIMIT_BOOST = 20
 BOOST_DAYS = 7
+MIN_USER_INTERVAL_SEC = 2.0
 BTN_MENU_RESTART = "🔄 Перезапуск бота"
-
 BTN_BACK_TO_MAIN = "В главное меню"
-
 BTN_PROFILE_FILL = "Заполнить профиль"
 BTN_PROFILE_FILL_AGAIN = "Заполнить профиль заново"
 BTN_PROFILE_CLEAR = "Очистить профиль"
-
 BTN_MODE_FREE_BASE = "Свободный режим"
 BTN_MODE_PROFILE_BASE = "Режим с памятью профиля"
-
 BTN_SKIP_QUESTION = "Пропустить этот вопрос"
 
 
@@ -114,29 +154,97 @@ def get_chat_keyboard() -> ReplyKeyboardMarkup:
         resize_keyboard=True,
         one_time_keyboard=False,
     )
+
+_TG_TAG_RE = re.compile(r'(?is)</?(?:b|i|u|s|code|pre)>|<a\s+href="[^"\n\r<>]+">|</a>')
+_TG_TOKEN_RE = re.compile(r'(?is)</?(?:b|i|u|s|code|pre)>|<a\s+href="[^"\n\r<>]+">|</a>|[^<]+')
+
+def is_rate_limited(user_id: int) -> bool:
+    now = asyncio.get_event_loop().time()
+    last = user_last_ts.get(user_id, 0.0)
+    user_last_ts[user_id] = now
+    return (now - last) < MIN_USER_INTERVAL_SEC
+
+def _tg_close_tag(tag: str) -> str:
+    return "</a>" if tag == "a" else f"</{tag}>"
+
+
+def _tg_close_all(open_stack: list[tuple[str, str]]) -> str:
+    return "".join(_tg_close_tag(tag) for tag, _open in reversed(open_stack))
+
+
+def _tg_reopen_all(open_stack: list[tuple[str, str]]) -> str:
+    return "".join(open_tok for _tag, open_tok in open_stack)
+
+
+def _tg_push(open_stack: list[tuple[str, str]], tok: str) -> None:
+    low = tok.lower()
+    if low.startswith("<a "):
+        open_stack.append(("a", tok))
+        return
+    m = re.match(r"(?is)<(b|i|u|s|code|pre)>", tok)
+    if m:
+        t = m.group(1).lower()
+        open_stack.append((t, f"<{t}>"))
+
+
+def _tg_pop(open_stack: list[tuple[str, str]], tok: str) -> None:
+    low = tok.lower()
+    if low == "</a>":
+        for i in range(len(open_stack) - 1, -1, -1):
+            if open_stack[i][0] == "a":
+                open_stack.pop(i)
+                return
+        return
+    m = re.match(r"(?is)</(b|i|u|s|code|pre)>", tok)
+    if m:
+        t = m.group(1).lower()
+        for i in range(len(open_stack) - 1, -1, -1):
+            if open_stack[i][0] == t:
+                open_stack.pop(i)
+                return
+
+
+def _split_telegram_html(text: str, limit: int = 3900) -> list[str]:
+    parts: list[str] = []
+    open_stack: list[tuple[str, str]] = []
+    cur = ""
+
+    for m in _TG_TOKEN_RE.finditer(text):
+        tok = m.group(0)
+
+        closing_len = sum(len(_tg_close_tag(tag)) for tag, _open in open_stack)
+        if cur and (len(cur) + len(tok) + closing_len) > limit:
+            chunk = (cur + _tg_close_all(open_stack)).strip()
+            if chunk:
+                parts.append(chunk)
+            cur = _tg_reopen_all(open_stack)
+
+        cur += tok
+
+        if _TG_TAG_RE.fullmatch(tok):
+            if tok.startswith("</"):
+                _tg_pop(open_stack, tok)
+            else:
+                _tg_push(open_stack, tok)
+
+    tail = (cur + _tg_close_all(open_stack)).strip()
+    if tail:
+        parts.append(tail)
+
+    return parts
+
+
 async def send_long(message: types.Message, text: str, reply_markup=None):
     t = sanitize_telegram_html((text or "").strip())
     if not t:
         return
-    limit = 3900
-    first = True
-    while len(t) > limit:
-        cut = t.rfind("\n", 0, limit)
-        if cut == -1:
-            cut = limit
-        part = t[:cut].strip()
-        if part:
-            if first:
-                await message.answer(part, reply_markup=reply_markup)
-                first = False
-            else:
-                await message.answer(part)
-        t = t[cut:].strip()
-    if t:
-        if first:
-            await message.answer(t, reply_markup=reply_markup)
+
+    chunks = _split_telegram_html(t, limit=3900)
+    for i, part in enumerate(chunks):
+        if i == 0:
+            await message.answer(part, reply_markup=reply_markup)
         else:
-            await message.answer(t)
+            await message.answer(part)
 
 _ALLOWED_TAG_RE = re.compile(
     r'(?is)</?(b|i|u|s|code|pre)>|<a\s+href="[^"\n\r<>]+">|</a>'
@@ -160,26 +268,6 @@ def sanitize_telegram_html(text: str) -> str:
         return tags[idx] if 0 <= idx < len(tags) else ""
 
     return re.sub(r"\x00(\d+)\x00", _restore, tmp)
-
-def is_country_answer_cacheable(text: str) -> bool:
-    if not text:
-        return False
-
-    low = text.strip().lower()
-    if low.startswith("ошибка"):
-        return False
-    if "httpsconnectionpool" in low or "ssleoferror" in low or "unexpected_eof" in low or "traceback" in low:
-        return False
-
-    plain = re.sub(r"<[^>]+>", "", text)
-    nums = re.findall(r"(?m)^\s*\d\.\s+", plain)
-    if len(nums) >= 8:
-        return True
-
-    if len(plain.strip()) >= 800:
-        return True
-
-    return False
 
 def get_help_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -453,8 +541,9 @@ async def handle_admin_callback(callback: types.CallbackQuery):
             return
 
     if action == "cache_del" and len(parts) >= 3:
-        key = parts[2]
-        await admin_delete_cache(key)
+        token = parts[2]
+        actual_key = admin_tmp.get(user_id, {}).get(f"cache:{token}", token)
+        await admin_delete_cache(actual_key)
         await callback.message.answer("Удалено.", reply_markup=admin_back_kb())
         return
 
@@ -514,15 +603,16 @@ async def handle_admin_input(message: types.Message, state: str):
         if not items:
             await message.answer("Пусто.", reply_markup=admin_back_kb())
             return
-
+        admin_tmp[user_id] = {}
         rows = []
         kb_rows = []
         for it in items:
-            ck = it.get("country_key")
-            cq = it.get("country_query")
+            ck = (it.get("country_key") or "").strip()
+            cq = (it.get("country_query") or "").strip()
+            token = hashlib.md5(ck.encode("utf-8")).hexdigest()[:10]
+            admin_tmp[user_id][f"cache:{token}"] = ck
             rows.append(f"{ck} — {cq}")
-            kb_rows.append([InlineKeyboardButton(text=f"🗑 {ck}", callback_data=f"admin:cache_del:{ck}")])
-
+            kb_rows.append([InlineKeyboardButton(text=f"🗑 {ck}", callback_data=f"admin:cache_del:{token}")])
         kb_rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin:root")])
         kb_rows.append([InlineKeyboardButton(text="🏠 В меню", callback_data="admin:main")])
 
@@ -558,7 +648,7 @@ async def show_limits_screen(message: types.Message, user_id: int):
         chat_used = await get_daily_user_message_count(user_id, "chat")
         country_used = await get_daily_user_message_count(user_id, "country")
     except Exception as e:
-        print("[BOT] get_daily_user_message_count error:", repr(e))
+        log_event("get_daily_user_message_count_error", user_id=user_id, mode="limits", err=e)
         chat_used = 0
         country_used = 0
 
@@ -586,7 +676,7 @@ async def get_effective_limits(user_id: int) -> tuple[int, int, Optional[datetim
     try:
         boost_until = await get_user_boost_until(user_id)
     except Exception as e:
-        print("[BOT] get_user_boost_until error:", repr(e))
+        log_event("get_user_boost_until_error", user_id=user_id, mode="limits", err=e)
         boost_until = None
 
     now = datetime.now(timezone.utc)
@@ -761,7 +851,7 @@ async def process_country_request(message: types.Message, user: types.User, coun
         try:
             used_today = await get_daily_user_message_count(user_id, "country")
         except Exception as e:
-            print("[BOT] get_daily_user_message_count(country) error:", repr(e))
+            log_event("get_daily_user_message_count_error", user_id=user_id, mode="country", err=e)
             used_today = 0
 
         if used_today >= country_limit:
@@ -776,7 +866,7 @@ async def process_country_request(message: types.Message, user: types.User, coun
     try:
         await save_message(user_id, "user", country_query, mode=("admin" if is_admin(user_id) else "country"))
     except Exception as e:
-        print("[BOT] save_message(user, country) error:", repr(e))
+        log_event("save_message_error", user_id=user_id, mode="country", err=e)
 
     user_busy[user_id] = True
     thinking_msg: Optional[types.Message] = None
@@ -787,7 +877,7 @@ async def process_country_request(message: types.Message, user: types.User, coun
         try:
             cached = await get_cached_country_info(country_key)
         except Exception as e:
-            print("[BOT] get_cached_country_info error:", repr(e))
+            log_event("get_cached_country_info_error", user_id=user_id, mode="country", err=e)
             cached = None
 
         if cached and is_country_answer_cacheable(cached):
@@ -799,7 +889,7 @@ async def process_country_request(message: types.Message, user: types.User, coun
             try:
                 await delete_cached_country_info(country_key)
             except Exception as e:
-                print("[BOT] delete_cached_country_info error:", repr(e))
+                log_event("delete_cached_country_info_error", user_id=user_id, mode="country", err=e)
 
 
         try:
@@ -811,7 +901,7 @@ async def process_country_request(message: types.Message, user: types.User, coun
                 language_code=user.language_code,
             )
         except Exception as e:
-            print("[BOT] ensure_user (country) error:", repr(e))
+            log_event("ensure_user_error", user_id=user_id, mode="country", err=e)
 
         await message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
         thinking_msg = await message.answer("⏳ Собираю информацию по стране...")
@@ -829,14 +919,14 @@ async def process_country_request(message: types.Message, user: types.User, coun
                     answer=answer,
                 )
             except Exception as e:
-                print("[BOT] save_cached_country_info error:", repr(e))
+                log_event("save_cached_country_info_error", user_id=user_id, mode="country", err=e)
 
 
         if thinking_msg:
             try:
                 await thinking_msg.delete()
             except Exception as e:
-                print("[BOT] delete thinking_msg (country) error:", repr(e))
+                log_event("delete_thinking_msg_error", user_id=user_id, mode="country", err=e)
 
         await send_long(message, answer, reply_markup=get_chat_keyboard())
         await send_country_again_prompt(message)
@@ -1130,6 +1220,26 @@ async def handle_menu_buttons(message: types.Message):
     if stage != "chat":
         await show_main_menu(message, user_id)
 
+async def handle_non_text_message(message: types.Message):
+    user = message.from_user
+    if not user:
+        return
+
+    user_id = user.id
+
+    if is_admin(user_id):
+        st = admin_state.get(user_id)
+        if st:
+            await message.answer("Пожалуйста, отправьте текст.")
+            return
+
+    stage = user_stage.get(user_id, "menu")
+
+    if stage in ("chat", "country_info"):
+        await message.answer("Пожалуйста, отправьте текстовое сообщение.", reply_markup=get_chat_keyboard())
+    else:
+        await message.answer("Пожалуйста, отправьте текстовое сообщение.", reply_markup=get_main_menu_keyboard())
+
 
 async def echo_message(message: types.Message):
     user = message.from_user
@@ -1141,6 +1251,9 @@ async def echo_message(message: types.Message):
             return
 
     user_text = (message.text or "").strip()
+    if not is_admin(user_id) and is_rate_limited(user_id):
+        await message.answer("Слишком быстро 🙌 Подождите пару секунд и отправьте ещё раз.")
+        return
 
     state = profile_state.get(user_id)
     if state:
@@ -1163,7 +1276,7 @@ async def echo_message(message: types.Message):
         try:
             used_today = await get_daily_user_message_count(user_id, "chat")
         except Exception as e:
-            print("[BOT] get_daily_user_message_count(chat) error:", repr(e))
+            log_event("get_daily_user_message_count_error", user_id=user_id, mode="chat", err=e)
             used_today = 0
 
         if used_today >= chat_limit:
@@ -1193,16 +1306,16 @@ async def echo_message(message: types.Message):
                 language_code=user.language_code,
             )
         except Exception as e:
-            print("[BOT] ensure_user error:", repr(e))
+            log_event("ensure_user_error", user_id=user_id, mode="chat", err=e)
 
         try:
             await save_message(user.id, "user", user_text, mode=("admin" if is_admin(user_id) else "chat"))
         except Exception as e:
-            print("[BOT] save_message(user) error:", repr(e))
+            log_event("save_message_error", user_id=user_id, mode="chat", err=e)
 
         mode = user_mode.get(user_id, "profile")
         profile = await get_user_profile(user.id) if mode == "profile" else None
-        history = await get_recent_messages(user.id, limit=6)
+        history = await get_recent_messages(user.id, limit=6, mode="chat")
 
         await message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
         thinking_msg = await message.answer(msg("thinking_chat"))
@@ -1212,13 +1325,13 @@ async def echo_message(message: types.Message):
         try:
             await save_message(user.id, "assistant", answer)
         except Exception as e:
-            print("[BOT] save_message(assistant) error:", repr(e))
+            log_event("save_message_error", user_id=user_id, mode="chat", err=e)
 
         if thinking_msg:
             try:
                 await thinking_msg.delete()
             except Exception as e:
-                print("[BOT] delete thinking_msg (chat) error:", repr(e))
+                log_event("delete_thinking_msg_error", user_id=user_id, mode="chat", err=e)
 
         await send_long(message, answer, reply_markup=get_chat_keyboard())
 
@@ -1227,11 +1340,20 @@ async def echo_message(message: types.Message):
 
 
 async def main():
+    init_logging()
+    validate_env()
+    log_event("bot_starting")
     await init_db()
+    log_event("bot_started")
+
+    session = AiohttpSession()
+    session._connector_init["family"] = socket.AF_INET
+    session._connector_init["ttl_dns_cache"] = 300
 
     bot = Bot(
         token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+        session=session,
     )
     dp = Dispatcher()
 
@@ -1274,14 +1396,19 @@ async def main():
         ]),
     )
 
+    dp.message.register(handle_non_text_message, (~F.text) & (~F.successful_payment))
     dp.message.register(echo_message, F.text)
 
-    print("Бот запущен. Нажми Ctrl+C для остановки.")
+    log_event("polling_start")
     try:
         await dp.start_polling(bot)
     finally:
+        log_event("bot_stopping")
         await close_db()
-
+        log_event("bot_stopped")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

@@ -17,9 +17,17 @@ PPLX_API_KEY = os.getenv("PPLX_API_KEY")
 PPLX_URL = "https://api.perplexity.ai/chat/completions"
 PPLX_MODEL = os.getenv("PPLX_MODEL", "sonar")
 
+HISTORY_ITEM_MAX_CHARS = int(os.getenv("HISTORY_ITEM_MAX_CHARS", "800"))
+HISTORY_TOTAL_MAX_CHARS = int(os.getenv("HISTORY_TOTAL_MAX_CHARS", "3000"))
+
+USER_MESSAGE_MAX_CHARS = int(os.getenv("USER_MESSAGE_MAX_CHARS", "2000"))
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 OPENAI_URL = os.getenv("OPENAI_URL", "https://api.openai.com/v1/responses")
+
+DOMAIN_GATE_ENABLED = (os.getenv("DOMAIN_GATE_ENABLED", "1").strip() == "1")
+DOMAIN_GATE_MODEL = os.getenv("DOMAIN_GATE_MODEL", OPENAI_MODEL)
 
 _session = requests.Session()
 
@@ -73,14 +81,31 @@ def _build_profile_context(profile: Optional[Dict[str, Any]]) -> str:
 def _build_history_context(history: Optional[List[Dict[str, Any]]]) -> str:
     if not history:
         return ""
+
     lines: List[str] = []
+    total = 0
+
     for m in history:
         role = m.get("role")
         text = (m.get("text") or "").strip()
         if not text:
             continue
+
+        text = re.sub(r"[ \t]{2,}", " ", text)
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+
+        if len(text) > HISTORY_ITEM_MAX_CHARS:
+            text = text[:HISTORY_ITEM_MAX_CHARS].rstrip()
+
         prefix = "Пользователь" if role == "user" else "Ассистент"
-        lines.append(f"{prefix}: {text}")
+        line = f"{prefix}: {text}"
+
+        if total + len(line) + 1 > HISTORY_TOTAL_MAX_CHARS:
+            break
+
+        lines.append(line)
+        total += len(line) + 1
+
     if not lines:
         return ""
     return "Краткая история (старые → новые):\n" + "\n".join(lines)
@@ -97,7 +122,6 @@ def _extract_json(text: str) -> Optional[str]:
         return None
     return m.group(0).strip()
 
-
 def _safe_json_loads(text: str) -> Optional[Dict[str, Any]]:
     j = _extract_json(text)
     if not j:
@@ -108,18 +132,20 @@ def _safe_json_loads(text: str) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
 
-
 def _normalize_sources(sources: Any) -> List[str]:
-    if not sources:
+    if not sources or not isinstance(sources, list):
         return []
-    if isinstance(sources, list):
-        out = []
-        for x in sources:
-            if isinstance(x, str) and x.strip():
-                out.append(x.strip())
-        return out
-    return []
-
+    out: List[str] = []
+    for x in sources:
+        if not isinstance(x, str):
+            continue
+        u = x.strip().strip("()[]<>.,;")
+        if not u:
+            continue
+        if not re.match(r"^https?://", u, flags=re.IGNORECASE):
+            continue
+        out.append(u)
+    return out
 
 def _normalize_list_str(x: Any) -> List[str]:
     if not x:
@@ -131,7 +157,6 @@ def _normalize_list_str(x: Any) -> List[str]:
                 out.append(v.strip())
         return out
     return []
-
 
 def _normalize_sections(x: Any) -> List[Dict[str, str]]:
     if not x or not isinstance(x, list):
@@ -147,7 +172,6 @@ def _normalize_sections(x: Any) -> List[Dict[str, str]]:
         out.append({"title": title, "body": body})
     return out
 
-
 def _perplexity_json(
     user_message: str,
     mode: Optional[str],
@@ -160,6 +184,9 @@ def _perplexity_json(
     user_message = (user_message or "").strip()
     if not user_message:
         return None, "Пустой запрос. Напишите вопрос текстом."
+
+    if len(user_message) > USER_MESSAGE_MAX_CHARS:
+        user_message = user_message[:USER_MESSAGE_MAX_CHARS].rstrip()
 
     if mode == "country":
         system_prompt = COUNTRY_INFO_PROMPT
@@ -279,6 +306,77 @@ def _perplexity_json(
     except Exception as e:
         return None, f"Ошибка при обращении к модели: {e}"
 
+def _openai_domain_gate(user_message: str, mode: Optional[str]) -> Optional[Tuple[bool, str]]:
+    if not DOMAIN_GATE_ENABLED:
+        return None
+    if not OPENAI_API_KEY:
+        return None
+
+    text = (user_message or "").strip()
+    if not text:
+        return None
+
+    if mode == "country":
+        sys = (
+            "Ты классификатор запросов для телеграм-бота про миграцию.\n"
+            "Определи, является ли запрос запросом справки по СТРАНЕ (например: 'Германия', 'Нидерланды', 'Расскажи про Канаду').\n"
+            "Если это не про страну/миграционную справку по стране, отклони.\n"
+            "Верни строго один JSON без текста вокруг:\n"
+            "{\"in_scope\": true/false, \"reply\": \"<строка>\"}\n"
+            "Если in_scope=false, reply: вежливо попроси ввести название страны (пример).\n"
+            "Если in_scope=true, reply должен быть пустой строкой.\n"
+        )
+        default_reply = "Этот раздел — справка по стране. Напишите название страны, например: Германия или Нидерланды."
+    else:
+        sys = (
+            "Ты классификатор запросов для телеграм-бота про международную миграцию.\n"
+            "Тема: визы, ВНЖ/ПМЖ, гражданство, работа/учёба за рубежом, документы для переезда, выбор страны, жизнь и адаптация за границей.\n"
+            "Если запрос НЕ относится к этим темам, отклони.\n"
+            "Верни строго один JSON без текста вокруг:\n"
+            "{\"in_scope\": true/false, \"reply\": \"<строка>\"}\n"
+            "Если in_scope=false, reply: вежливый отказ и просьба переформулировать вопрос в миграционном контексте.\n"
+            "Если in_scope=true, reply должен быть пустой строкой.\n"
+        )
+        default_reply = (
+            "Я отвечаю только на вопросы про международную миграцию и переезд (визы, ВНЖ, работа/учёба за рубежом, выбор страны). "
+            "Переформулируйте вопрос в миграционном контексте."
+        )
+
+    payload = {
+        "model": DOMAIN_GATE_MODEL,
+        "input": [
+            {"role": "system", "content": sys},
+            {"role": "user", "content": text},
+        ],
+    }
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        resp = requests.post(OPENAI_URL, json=payload, headers=headers, timeout=(10, 30))
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError:
+            return None
+
+        data = resp.json()
+        out = _openai_get_text(data)
+        obj = _safe_json_loads(out)
+        if not obj:
+            return None
+
+        in_scope = bool(obj.get("in_scope"))
+        reply = str(obj.get("reply") or "").strip()
+
+        if in_scope:
+            return True, ""
+
+        return False, (reply or default_reply)
+    except Exception:
+        return None
 
 def _openai_get_text(data: Dict[str, Any]) -> str:
     if not isinstance(data, dict):
@@ -318,7 +416,7 @@ def _openai_render_from_json(user_message: str, mode: Optional[str], obj: Dict[s
             "Не добавляй факты, цифры, сроки, требования и ссылки, которых нет в JSON.\n"
             "Не используй markdown.\n"
             "Между блоками оставляй пустую строку.\n"
-            "Если sources есть, используй их только в блоке 7 «Источники».\n"
+            "Если sources есть, используй их только в блоке 7 «Официальные источники».\n"
             "Никогда не используй символы < и > в обычном тексте."
         )
     else:
@@ -331,16 +429,23 @@ def _openai_render_from_json(user_message: str, mode: Optional[str], obj: Dict[s
             "Делай блоки с пустой строкой между ними.\n"
             "Списки оформляй строками с '• ' в начале.\n"
             "Не делай теги незакрытыми и не растягивай один тег на несколько абзацев.\n"
-            "Если есть sources, в конце добавь блок <b>Источники:</b> и перечисли URL строками.\n"
+            "Если есть sources, в конце добавь блок <b>Официальные источники:</b> и перечисли URL строками.\n"
             "Никогда не используй символы < и > в обычном тексте."
         )
 
     payload = {
         "model": OPENAI_MODEL,
+        "instructions": sys,
         "input": [
-            {"role": "system", "content": sys},
-            {"role": "user", "content": "Вопрос пользователя:\n" + (user_message or "") + "\n\nJSON:\n" + json.dumps(obj, ensure_ascii=False)},
+            {
+                "role": "user",
+                "content": "Вопрос пользователя:\n"
+                + (user_message or "")
+                + "\n\nJSON:\n"
+                + json.dumps(obj, ensure_ascii=False),
+            }
         ],
+        "store": False,
     }
 
     headers = {
@@ -349,7 +454,7 @@ def _openai_render_from_json(user_message: str, mode: Optional[str], obj: Dict[s
     }
 
     try:
-        resp = requests.post(OPENAI_URL, json=payload, headers=headers, timeout=(10, 60))
+        resp = _session.post(OPENAI_URL, json=payload, headers=headers, timeout=(10, 60))
         try:
             resp.raise_for_status()
         except requests.HTTPError:
@@ -369,7 +474,6 @@ def _openai_render_from_json(user_message: str, mode: Optional[str], obj: Dict[s
     except Exception as e:
         print(f"[OPENAI] exception {e}")
         return None
-
 
 def _fallback_render(obj: Dict[str, Any], mode: Optional[str]) -> str:
     sources = _normalize_sources(obj.get("sources"))
@@ -417,6 +521,10 @@ def ask_llm(
     profile: Optional[Dict[str, Any]] = None,
     history: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
+    gate = _openai_domain_gate(user_message, mode)
+    if gate is not None and gate[0] is False:
+        return gate[1]
+
     obj, raw_or_err = _perplexity_json(user_message, mode, profile, history)
     if obj is None:
         return raw_or_err

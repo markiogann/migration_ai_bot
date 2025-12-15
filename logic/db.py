@@ -13,6 +13,8 @@ _pool: Optional[asyncpg.Pool] = None
 
 MAX_MESSAGES_PER_USER = 200
 
+COUNTRY_CACHE_TTL_DAYS = int(os.getenv("COUNTRY_CACHE_TTL_DAYS", "45"))
+
 ALLOWED_PROFILE_FIELDS = {
     "username",
     "first_name",
@@ -105,7 +107,13 @@ async def init_db():
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_country_cache_key ON country_info_cache (country_key);"
         )
-
+        await conn.execute(
+            """
+            DELETE FROM country_info_cache
+            WHERE created_at < NOW() - ($1 * INTERVAL '1 day');
+            """,
+            COUNTRY_CACHE_TTL_DAYS,
+        )
 
 async def close_db():
     global _pool
@@ -204,7 +212,7 @@ async def save_message(tg_user_id: int, role: str, text: str, mode: str = "chat"
                     SELECT id
                     FROM messages
                     WHERE tg_user_id = $1
-                    ORDER BY id ASC
+                    ORDER BY id DESC
                     OFFSET $2
                 );
                 """,
@@ -212,23 +220,35 @@ async def save_message(tg_user_id: int, role: str, text: str, mode: str = "chat"
                 MAX_MESSAGES_PER_USER,
             )
 
-
-async def get_recent_messages(tg_user_id: int, limit: int = 6) -> List[Dict]:
+async def get_recent_messages(tg_user_id: int, limit: int = 6, mode: Optional[str] = None) -> List[Dict]:
     pool = _require_pool()
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT role, text, created_at
-            FROM messages
-            WHERE tg_user_id = $1
-            ORDER BY id DESC
-            LIMIT $2;
-            """,
-            tg_user_id,
-            limit,
-        )
+        if mode:
+            rows = await conn.fetch(
+                """
+                SELECT role, text, created_at
+                FROM messages
+                WHERE tg_user_id = $1 AND mode = $2
+                ORDER BY id DESC
+                LIMIT $3;
+                """,
+                tg_user_id,
+                mode,
+                limit,
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT role, text, created_at
+                FROM messages
+                WHERE tg_user_id = $1
+                ORDER BY id DESC
+                LIMIT $2;
+                """,
+                tg_user_id,
+                limit,
+            )
     return [dict(r) for r in reversed(rows)]
-
 
 async def get_daily_user_message_count(tg_user_id: int, mode: str) -> int:
     pool = _require_pool()
@@ -258,10 +278,15 @@ async def get_cached_country_info(country_key: str) -> Optional[str]:
 
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT answer FROM country_info_cache WHERE country_key = $1;",
+            """
+            SELECT answer
+            FROM country_info_cache
+            WHERE country_key = $1
+              AND created_at >= NOW() - ($2 * INTERVAL '1 day');
+            """,
             key,
+            COUNTRY_CACHE_TTL_DAYS,
         )
-
     return row["answer"] if row else None
 
 
@@ -282,6 +307,13 @@ async def save_cached_country_info(country_key: str, country_query: str, answer:
             key,
             country_query,
             answer,
+        )
+        await conn.execute(
+            """
+            DELETE FROM country_info_cache
+            WHERE created_at < NOW() - ($1 * INTERVAL '1 day');
+            """,
+            COUNTRY_CACHE_TTL_DAYS,
         )
 
 async def delete_cached_country_info(country_key: str) -> None:
