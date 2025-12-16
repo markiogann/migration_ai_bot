@@ -21,6 +21,7 @@ from aiogram.types import (
     PreCheckoutQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    LinkPreviewOptions,
 )
 from aiogram.filters import CommandStart, Command
 from aiogram.enums import ChatAction, ParseMode
@@ -28,6 +29,7 @@ from aiogram.client.default import DefaultBotProperties
 
 from config import BOT_TOKEN, ADMIN_IDS
 from logic.ai import ask_llm
+from logic.db import start_new_dialog
 from logic.db import (
    init_db,
     close_db,
@@ -63,6 +65,7 @@ user_stage: Dict[int, str] = {}
 admin_state: Dict[int, str] = {}
 admin_tmp: Dict[int, Dict[str, str]] = {}
 user_last_ts: Dict[int, float] = {}
+user_dialog: Dict[int, Dict[str, str]] = {}
 
 def log_event(event: str, user_id: Optional[int] = None, mode: Optional[str] = None, err: Optional[Exception] = None):
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -97,6 +100,13 @@ def init_logging():
                 f.write("")
         except Exception:
             pass
+
+async def reset_dialog(user_id: int, mode: str) -> str:
+    did = await start_new_dialog(user_id, mode=mode)
+    if user_id not in user_dialog:
+        user_dialog[user_id] = {}
+    user_dialog[user_id][mode] = did
+    return did
 
 
 BTN_MENU_CHAT = "💬 Общение с ботом"
@@ -240,11 +250,13 @@ async def send_long(message: types.Message, text: str, reply_markup=None):
         return
 
     chunks = _split_telegram_html(t, limit=3900)
+    lp = LinkPreviewOptions(is_disabled=True)
+
     for i, part in enumerate(chunks):
         if i == 0:
-            await message.answer(part, reply_markup=reply_markup)
+            await message.answer(part, reply_markup=reply_markup, link_preview_options=lp)
         else:
-            await message.answer(part)
+            await message.answer(part, link_preview_options=lp)
 
 _ALLOWED_TAG_RE = re.compile(
     r'(?is)</?(b|i|u|s|code|pre)>|<a\s+href="[^"\n\r<>]+">|</a>'
@@ -752,6 +764,9 @@ async def cmd_start(message: types.Message):
     user_stage[user_id] = "menu"
     profile_state.pop(user_id, None)
 
+    await reset_dialog(user_id, "chat")
+    await reset_dialog(user_id, "country")
+
     await message.answer(msg("welcome"), reply_markup=get_main_menu_keyboard())
 
 
@@ -862,9 +877,12 @@ async def process_country_request(message: types.Message, user: types.User, coun
             )
             return
 
+    dialog_id = user_dialog.get(user_id, {}).get("country")
+    if not dialog_id:
+        dialog_id = await reset_dialog(user_id, "country")
 
     try:
-        await save_message(user_id, "user", country_query, mode=("admin" if is_admin(user_id) else "country"))
+        await save_message(user_id, "user", country_query, mode="country", dialog_id=dialog_id)
     except Exception as e:
         log_event("save_message_error", user_id=user_id, mode="country", err=e)
 
@@ -890,7 +908,6 @@ async def process_country_request(message: types.Message, user: types.User, coun
                 await delete_cached_country_info(country_key)
             except Exception as e:
                 log_event("delete_cached_country_info_error", user_id=user_id, mode="country", err=e)
-
 
         try:
             await ensure_user(
@@ -920,7 +937,6 @@ async def process_country_request(message: types.Message, user: types.User, coun
                 )
             except Exception as e:
                 log_event("save_cached_country_info_error", user_id=user_id, mode="country", err=e)
-
 
         if thinking_msg:
             try:
@@ -969,7 +985,6 @@ async def handle_help_callback(callback: types.CallbackQuery):
         text = msg(msg_key, "Пока нет текста для этой темы.")
         await callback.message.answer(text)
         return
-
 
     if data.startswith("faqm:"):
         slug = data.split(":", 1)[1]
@@ -1084,6 +1099,7 @@ async def handle_menu_buttons(message: types.Message):
 
     if normalized == BTN_MENU_CHAT:
         user_stage[user_id] = "chat"
+        await reset_dialog(user_id, "chat")
         await message.answer(msg("chat_intro"), reply_markup=get_chat_keyboard())
         return
 
@@ -1138,7 +1154,6 @@ async def handle_menu_buttons(message: types.Message):
             reply_markup=build_faq_keyboard("faqm", FAQ_MIGRATION_TOPICS),
         )
         return
-
 
     if normalized == BTN_MENU_LIMITS:
         user_stage[user_id] = "menu"
@@ -1287,8 +1302,6 @@ async def echo_message(message: types.Message):
             )
             return
 
-
-
     if user_busy.get(user_id):
         await message.answer("Я ещё отвечаю на ваш предыдущий вопрос. Подождите, пожалуйста 🙌")
         return
@@ -1308,14 +1321,18 @@ async def echo_message(message: types.Message):
         except Exception as e:
             log_event("ensure_user_error", user_id=user_id, mode="chat", err=e)
 
+        dialog_id = user_dialog.get(user_id, {}).get("chat")
+        if not dialog_id:
+            dialog_id = await reset_dialog(user_id, "chat")
+
         try:
-            await save_message(user.id, "user", user_text, mode=("admin" if is_admin(user_id) else "chat"))
+            await save_message(user.id, "user", user_text, mode="chat", dialog_id=dialog_id)
         except Exception as e:
             log_event("save_message_error", user_id=user_id, mode="chat", err=e)
 
         mode = user_mode.get(user_id, "profile")
         profile = await get_user_profile(user.id) if mode == "profile" else None
-        history = await get_recent_messages(user.id, limit=6, mode="chat")
+        history = await get_recent_messages(user.id, limit=6, mode="chat", dialog_id=dialog_id)
 
         await message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
         thinking_msg = await message.answer(msg("thinking_chat"))
@@ -1323,7 +1340,7 @@ async def echo_message(message: types.Message):
         answer = await call_llm(user_text, "chat", profile=profile, history=history)
 
         try:
-            await save_message(user.id, "assistant", answer)
+            await save_message(user.id, "assistant", answer, mode="chat", dialog_id=dialog_id)
         except Exception as e:
             log_event("save_message_error", user_id=user_id, mode="chat", err=e)
 

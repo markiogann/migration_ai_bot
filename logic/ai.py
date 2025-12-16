@@ -7,6 +7,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from dotenv import load_dotenv
+from openai import OpenAI
 
 from logic.prompts import MIGRATION_ASSISTANT_SYSTEM_PROMPT
 from logic.prompts_country_info import COUNTRY_INFO_PROMPT
@@ -25,6 +26,15 @@ USER_MESSAGE_MAX_CHARS = int(os.getenv("USER_MESSAGE_MAX_CHARS", "2000"))
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 OPENAI_URL = os.getenv("OPENAI_URL", "https://api.openai.com/v1/responses")
+_openai_client: Optional[OpenAI] = None
+
+def _get_openai_client() -> Optional[OpenAI]:
+    global _openai_client
+    if not OPENAI_API_KEY:
+        return None
+    if _openai_client is None:
+        _openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    return _openai_client
 
 DOMAIN_GATE_ENABLED = (os.getenv("DOMAIN_GATE_ENABLED", "1").strip() == "1")
 DOMAIN_GATE_MODEL = os.getenv("DOMAIN_GATE_MODEL", OPENAI_MODEL)
@@ -221,14 +231,12 @@ def _perplexity_json(
         system_prompt = MIGRATION_ASSISTANT_SYSTEM_PROMPT
         schema = (
             "{"
-            "\"topic\":\"<строка>\","
-            "\"summary\":\"<строка>\","
-            "\"need_to_clarify\":[\"<строка>\"],"
-            "\"sections\":[{\"title\":\"<строка>\",\"body\":\"<строка>\"}],"
-            "\"next_steps\":[\"<строка>\"],"
+            "\"answer\":\"<строка>\","
+            "\"clarify\":[\"<строка>\"],"
             "\"sources\":[\"<url>\"]"
             "}"
         )
+
         ctx = "\n\n".join(
             x for x in [
                 (f"Режим: {mode}" if mode else ""),
@@ -241,10 +249,9 @@ def _perplexity_json(
             f"Схема: {schema}\n"
             "Требования:\n"
             "- Ответ на русском.\n"
-            "- summary: 2–5 предложений.\n"
-            "- need_to_clarify: 0–3 пункта только если реально не хватает данных.\n"
-            "- sections: 3–7 секций, структурно.\n"
-            "- next_steps: 3–7 конкретных шагов.\n"
+            "- answer: 2–8 коротких предложений, дружелюбно и по делу, как в чате.\n"
+            "- Не используй канцелярит, не делай длинных вступлений.\n"
+            "- clarify: 0–2 уточняющих вопроса только если реально не хватает данных.\n"
             "- sources: только реальные URL. Если не уверен в точном URL, не добавляй его.\n"
             "- Не используй markdown.\n"
             "\n"
@@ -252,6 +259,7 @@ def _perplexity_json(
             + "Сообщение пользователя: "
             + user_message
         )
+
 
     payload = {
         "model": PPLX_MODEL,
@@ -309,61 +317,64 @@ def _perplexity_json(
 def _openai_domain_gate(user_message: str, mode: Optional[str]) -> Optional[Tuple[bool, str]]:
     if not DOMAIN_GATE_ENABLED:
         return None
-    if not OPENAI_API_KEY:
+    client = _get_openai_client()
+    if not client:
         return None
-
     text = (user_message or "").strip()
     if not text:
         return None
-
     if mode == "country":
         sys = (
-            "Ты классификатор запросов для телеграм-бота про миграцию.\n"
-            "Определи, является ли запрос запросом справки по СТРАНЕ (например: 'Германия', 'Нидерланды', 'Расскажи про Канаду').\n"
-            "Если это не про страну/миграционную справку по стране, отклони.\n"
+            "Ты маршрутизатор запросов для раздела «справка по стране» в телеграм-боте про миграцию.\n"
+            "Определи, является ли сообщение запросом справки по стране (например: 'Германия', 'Нидерланды', 'Расскажи про Канаду').\n"
+            "\n"
             "Верни строго один JSON без текста вокруг:\n"
             "{\"in_scope\": true/false, \"reply\": \"<строка>\"}\n"
-            "Если in_scope=false, reply: вежливо попроси ввести название страны (пример).\n"
-            "Если in_scope=true, reply должен быть пустой строкой.\n"
+            "\n"
+            "Правила:\n"
+            "1) Если пользователь реально просит справку по стране или написал название страны — in_scope=true, reply=\"\".\n"
+            "2) Если сообщение не похоже на страну, но это привет/как дела/спасибо/кто ты — in_scope=false и reply: коротко ответь 1–2 предложения и попроси ввести страну (пример).\n"
+            "3) Если сообщение не похоже на страну — in_scope=false и reply: вежливо попроси ввести название страны (пример).\n"
+            "\n"
+            "reply всегда на русском, без HTML и без markdown. Не используй символы < и >.\n"
         )
         default_reply = "Этот раздел — справка по стране. Напишите название страны, например: Германия или Нидерланды."
     else:
         sys = (
-            "Ты классификатор запросов для телеграм-бота про международную миграцию.\n"
-            "Тема: визы, ВНЖ/ПМЖ, гражданство, работа/учёба за рубежом, документы для переезда, выбор страны, жизнь и адаптация за границей.\n"
-            "Если запрос НЕ относится к этим темам, отклони.\n"
+            "Ты маршрутизатор запросов для телеграм-бота про международную миграцию.\n"
+            "Основная тема бота: визы, ВНЖ/ПМЖ, гражданство, работа/учёба за рубежом, документы для переезда, выбор страны, жизнь и адаптация за границей.\n"
+            "\n"
+            "Твоя задача: решить, передавать ли запрос основному ИИ.\n"
             "Верни строго один JSON без текста вокруг:\n"
             "{\"in_scope\": true/false, \"reply\": \"<строка>\"}\n"
-            "Если in_scope=false, reply: вежливый отказ и просьба переформулировать вопрос в миграционном контексте.\n"
-            "Если in_scope=true, reply должен быть пустой строкой.\n"
+            "\n"
+            "Правила:\n"
+            "1) Если запрос по теме миграции — in_scope=true, reply=\"\".\n"
+            "2) Если запрос НЕ по теме, но это нормальная бытовая коммуникация (привет, как дела, спасибо, кто ты, что умеешь, как пользоваться ботом) — in_scope=false и reply: короткий дружелюбный ответ 1–2 предложения + в конце мягко предложи помощь по миграции.\n"
+            "3) Если запрос НЕ по теме и это что-то нейтральное и простое, на что можно ответить очень коротко и безопасно — можешь дать 1 короткое предложение по сути, затем мягко вернуть к миграции.\n"
+            "4) Если запрос НЕ по теме и требует длинной консультации в другой области — in_scope=false и reply: вежливо скажи, что бот про миграцию, и попроси переформулировать в миграционном контексте.\n"
+            "5) Если запрос опасный/вредный, медицинский, про самоповреждение, незаконные действия — in_scope=false и reply: вежливый отказ без инструкций + предложи задать вопрос по миграции.\n"
+            "6) Если запрос состоит из одного-двух слов типа 'привет', 'ку', 'йо' — ответь очень коротко, без лишнего.\n"
+            "\n"
+            "reply всегда на русском, без HTML и без markdown. Не используй символы < и >.\n"
         )
         default_reply = (
-            "Я отвечаю только на вопросы про международную миграцию и переезд (визы, ВНЖ, работа/учёба за рубежом, выбор страны). "
-            "Переформулируйте вопрос в миграционном контексте."
+            "Я специализируюсь на вопросах международной миграции и переезда (визы, ВНЖ, работа/учёба, выбор страны). "
+            "Сформулируйте вопрос в миграционном контексте — и я помогу."
         )
 
-    payload = {
-        "model": DOMAIN_GATE_MODEL,
-        "input": [
-            {"role": "system", "content": sys},
-            {"role": "user", "content": text},
-        ],
-    }
-
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
     try:
-        resp = requests.post(OPENAI_URL, json=payload, headers=headers, timeout=(10, 30))
-        try:
-            resp.raise_for_status()
-        except requests.HTTPError:
-            return None
+        resp = client.responses.create(
+            model=DOMAIN_GATE_MODEL,
+            max_output_tokens=160,
+            input=[
+                {"role": "system", "content": sys},
+                {"role": "user", "content": text},
+            ],
+            store=False,
+        )
 
-        data = resp.json()
-        out = _openai_get_text(data)
+        out = (resp.output_text or "").strip()
         obj = _safe_json_loads(out)
         if not obj:
             return None
@@ -403,9 +414,9 @@ def _openai_get_text(data: Dict[str, Any]) -> str:
 
 
 def _openai_render_from_json(user_message: str, mode: Optional[str], obj: Dict[str, Any]) -> Optional[str]:
-    if not OPENAI_API_KEY:
+    client = _get_openai_client()
+    if not client:
         return None
-
     if mode == "country":
         sys = (
             "Ты редактор справки по стране для телеграм-бота.\n"
@@ -422,98 +433,70 @@ def _openai_render_from_json(user_message: str, mode: Optional[str], obj: Dict[s
     else:
         sys = (
             "Ты редактор ответов миграционного бота.\n"
-            "Собери итоговый ответ по-русски, красиво и структурно.\n"
+            "Собери итоговый ответ по-русски, как живое общение в чате.\n"
             "Формат вывода: Telegram HTML. Разрешены только теги: <b>, <i>, <u>, <s>, <code>, <pre>, <a href=\"...\">...</a>.\n"
             "Не используй markdown.\n"
+            "Ответ должен быть коротким и человечным: 1–2 абзаца.\n"
+            "Если в JSON есть clarify, добавь в конце блок <b>Уточню:</b> и 1–2 вопроса.\n"
+            "Если есть sources, добавь в конце блок <b>Официальные источники:</b> и перечисли URL строками.\n"
             "Запрещено добавлять новые факты, цифры, сроки, требования и URL. Используй только то, что есть в JSON.\n"
-            "Делай блоки с пустой строкой между ними.\n"
-            "Списки оформляй строками с '• ' в начале.\n"
-            "Не делай теги незакрытыми и не растягивай один тег на несколько абзацев.\n"
-            "Если есть sources, в конце добавь блок <b>Официальные источники:</b> и перечисли URL строками.\n"
             "Никогда не используй символы < и > в обычном тексте."
         )
 
-    payload = {
-        "model": OPENAI_MODEL,
-        "instructions": sys,
-        "input": [
-            {
-                "role": "user",
-                "content": "Вопрос пользователя:\n"
-                + (user_message or "")
-                + "\n\nJSON:\n"
-                + json.dumps(obj, ensure_ascii=False),
-            }
-        ],
-        "store": False,
-    }
-
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
     try:
-        resp = _session.post(OPENAI_URL, json=payload, headers=headers, timeout=(10, 60))
-        try:
-            resp.raise_for_status()
-        except requests.HTTPError:
-            print(f"[OPENAI] http_error status={resp.status_code} body={(resp.text or '')[:300]}")
-            return None
+        resp = client.responses.create(
+            model=OPENAI_MODEL,
+            instructions=sys,
+            input=[
+                {
+                    "role": "user",
+                    "content": "Вопрос пользователя:\n"
+                    + (user_message or "")
+                    + "\n\nJSON:\n"
+                    + json.dumps(obj, ensure_ascii=False),
+                }
+            ],
+            store=False,
+        )
 
-        data = resp.json()
-        rid = data.get("id")
-        model = data.get("model")
-        usage = data.get("usage")
-        out = _openai_get_text(data)
-        print(f"[OPENAI] ok id={rid} model={model} usage={usage} out_len={len(out)}")
-
+        out = (resp.output_text or "").strip()
         if not out:
             return None
         return _cleanup_text(out)
-    except Exception as e:
-        print(f"[OPENAI] exception {e}")
+    except Exception:
         return None
 
 def _fallback_render(obj: Dict[str, Any], mode: Optional[str]) -> str:
     sources = _normalize_sources(obj.get("sources"))
     sections = _normalize_sections(obj.get("sections"))
-
     parts: List[str] = []
-
-    if mode != "country":
-        summary = str(obj.get("summary") or "").strip()
-        if summary:
-            parts.append(summary)
-
-        need = _normalize_list_str(obj.get("need_to_clarify"))
-        if need:
-            parts.append("Нужно уточнить:")
-            for x in need[:3]:
-                parts.append(f"• {x}")
-
-    for s in sections:
-        title = (s.get("title") or "").strip()
-        body = (s.get("body") or "").strip()
-        if title:
-            parts.append(title)
-        if body:
-            parts.append(body)
-
-    if mode != "country":
-        steps = _normalize_list_str(obj.get("next_steps"))
-        if steps:
-            parts.append("Следующие шаги:")
-            for x in steps[:7]:
-                parts.append(f"• {x}")
-
+    if mode == "country":
+        for s in sections:
+            title = (s.get("title") or "").strip()
+            body = (s.get("body") or "").strip()
+            if title:
+                parts.append(title)
+            if body:
+                parts.append(body)
+        if sources:
+            parts.append("Источники:")
+            for u in sources[:10]:
+                parts.append(u)
+        return "\n\n".join([p for p in parts if p.strip()]).strip()
+    answer = str(obj.get("answer") or "").strip()
+    if answer:
+        parts.append(answer)
+    clarify = _normalize_list_str(obj.get("clarify"))
+    if clarify:
+        parts.append("Уточню:")
+        for x in clarify[:2]:
+            parts.append(f"• {x}")
     if sources:
-        parts.append("Источники:")
+        parts.append("Официальные источники:")
         for u in sources[:10]:
             parts.append(u)
 
-    return "\n".join([p for p in parts if p.strip()]).strip()
-
+    return "\n\n".join([p for p in parts if p.strip()]).strip()
 
 def ask_llm(
     user_message: str,
@@ -533,9 +516,7 @@ def ask_llm(
     cleaned_obj["sources"] = _normalize_sources(cleaned_obj.get("sources"))
     cleaned_obj["sections"] = _normalize_sections(cleaned_obj.get("sections"))
     if mode != "country":
-        cleaned_obj["need_to_clarify"] = _normalize_list_str(cleaned_obj.get("need_to_clarify"))
-        cleaned_obj["next_steps"] = _normalize_list_str(cleaned_obj.get("next_steps"))
-
+        cleaned_obj["clarify"] = _normalize_list_str(cleaned_obj.get("clarify"))
     rendered = _openai_render_from_json(user_message, mode, cleaned_obj)
     if rendered:
         return rendered
